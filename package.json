@@ -1,0 +1,43 @@
+{
+  "name": "n8n-hubspot-probability-weighted-forecast-calculator",
+  "version": "1.0.0",
+  "description": "Scheduled revenue analytics for n8n and Node.js: derives stage-by-stage win probabilities from HubSpot deal-stage history, applies them to open pipeline, and upserts probability-weighted forecasts into Google Sheets. DRY_RUN and SANDBOX_MODE are on by default.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/calculator.test.js",
+    "dry-run": "node src/index.js --fixture test/fixtures/hubspot-deals-mock.json --now 2026-11-14T00:00:00Z",
+    "start": "node src/index.js",
+    "build:workflow": "node scripts/build-workflow.js",
+    "check:workflow": "node scripts/build-workflow.js --check"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "workflow.json",
+    "README.md",
+    "DISCLAIMER.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "keywords": [
+    "n8n",
+    "hubspot",
+    "forecast",
+    "weighted-pipeline",
+    "win-rate",
+    "revops",
+    "google-sheets",
+    "sales-analytics"
+  ],
+  "author": "DH Robin <robin@dhrobinsystems.com> (https://dhrobinsystems.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dhrobinsystems/n8n-hubspot-probability-weighted-forecast-calculator.git"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
