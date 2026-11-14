@@ -1,0 +1,312 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * build-workflow.js
+ *
+ * Generates workflow.json from src/ so the n8n Code nodes run exactly the same
+ * config gates and forecast math as the standalone engine.
+ *
+ *   node scripts/build-workflow.js          regenerate workflow.json
+ *   node scripts/build-workflow.js --check  exit 1 if workflow.json is stale
+ *
+ * The workflow intentionally contains NO credential references. After import,
+ * I select my own HubSpot and Google Sheets credentials on each node.
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const ROOT = path.resolve(__dirname, '..');
+const OUTPUT = path.join(ROOT, 'workflow.json');
+const CONFIG_NODE = 'Load Config & Safety Gates';
+const GATE_NODE = 'Enforce Portal Gate';
+const PLAN_NODE = 'Plan Deal Fetch';
+const PIPELINES_NODE = 'HubSpot: Deal Pipelines';
+const CALC_NODE = 'Calculate Forecast';
+
+function extractCore(relativeFile, name) {
+  const source = fs.readFileSync(path.join(ROOT, relativeFile), 'utf8');
+  const start = '// <n8n-core:' + name + '>';
+  const end = '// </n8n-core:' + name + '>';
+  const i = source.indexOf(start);
+  const j = source.indexOf(end);
+  if (i === -1 || j === -1 || j < i) throw new Error('Missing n8n-core:' + name + ' markers in ' + relativeFile);
+  return source.slice(i, j + end.length);
+}
+
+function bodyOf(fn) {
+  const text = fn.toString();
+  const lines = text.slice(text.indexOf('{') + 1, text.lastIndexOf('}')).split('\n');
+  while (lines.length && lines[0].trim() === '') lines.shift();
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  const indent = Math.min.apply(null, lines.filter(function (l) { return l.trim(); }).map(function (l) { return l.match(/^ */)[0].length; }));
+  return lines.map(function (l) { return l.slice(indent); }).join('\n');
+}
+
+/* eslint-disable no-undef */
+// These functions never run in Node; their bodies become Code-node source.
+
+function configGlue() {
+  const readEnv = (key) => {
+    try {
+      const value = $env[key];
+      return value === undefined || value === null ? undefined : String(value);
+    } catch (error) {
+      return undefined; // N8N_BLOCK_ENV_ACCESS_IN_NODE=true: keep the fail-safe defaults
+    }
+  };
+  const env = {};
+  for (const key of CONFIG_KEYS) env[key] = readEnv(key);
+  const config = parseConfig(env);
+  const dashboardUrl = readEnv('DASHBOARD_WEBHOOK_URL');
+  config.dashboardWebhookConfigured = Boolean(dashboardUrl && /^https:\/\//i.test(dashboardUrl.trim()));
+  return [{ json: { config } }];
+}
+
+function gateGlue() {
+  const config = $('Load Config & Safety Gates').first().json.config;
+  const account = $input.first().json;
+  if (!account || account.error || account.portalId === undefined) {
+    throw new Error('Unable to verify the HubSpot portal. No deal data was read.');
+  }
+  const verdict = evaluateHubSpotTarget(config, account);
+  if (!verdict.allowed) throw new Error('HubSpot read blocked by gate: ' + verdict.reason);
+  return [{ json: { config, portal: { portalId: account.portalId, accountType: account.accountType, verdict: verdict.reason } } }];
+}
+
+function planGlue() {
+  const config = $('Enforce Portal Gate').first().json.config;
+  const pipelinesBody = $input.first().json;
+  const normalized = normalizePipelines(pipelinesBody, config);
+  if (!normalized.pipelines.length) throw new Error('No deal pipelines available to forecast (check PIPELINE_IDS).');
+  return [{ json: { config, properties: buildDealPropertyList(normalized.pipelines).join(',') } }];
+}
+
+function calculateGlue() {
+  const config = $('Plan Deal Fetch').first().json.config;
+  const portal = $('Enforce Portal Gate').first().json.portal;
+  const pipelinesBody = $('HubSpot: Deal Pipelines').first().json;
+  const pages = $input.all().map((item) => item.json);
+  const last = pages[pages.length - 1];
+  const truncated = pages.length >= config.maxDealPages && Boolean(last && last.paging && last.paging.next);
+  const result = calculateForecast({ config, pipelinesBody, dealPages: pages, truncated, now: new Date() });
+  return [{
+    json: {
+      runAt: result.runAt,
+      runDate: result.runDate,
+      writeMode: result.writeMode,
+      writesEnabled: config.writesEnabled,
+      dashboardWebhookConfigured: config.dashboardWebhookConfigured,
+      target: config.target,
+      portal,
+      dealsFetched: result.dealsFetched,
+      dealsOutsideSelectedPipelines: result.dealsOutsideSelectedPipelines,
+      warnings: result.warnings,
+      rows: result.rows
+    }
+  }];
+}
+
+function summaryRowsGlue() {
+  return $input.first().json.rows.summary.map((row) => ({ json: row }));
+}
+
+function stageRowsGlue() {
+  return $input.first().json.rows.stages.map((row) => ({ json: row }));
+}
+
+function periodRowsGlue() {
+  return $input.first().json.rows.periods.map((row) => ({ json: row }));
+}
+/* eslint-enable no-undef */
+
+function codeNode(name, id, position, cores, glue) {
+  return {
+    parameters: { jsCode: '// GENERATED by scripts/build-workflow.js from src/. Edit src/, then rebuild.\n' + cores.concat([bodyOf(glue)]).join('\n\n') + '\n' },
+    id: id,
+    name: name,
+    type: 'n8n-nodes-base.code',
+    typeVersion: 2,
+    position: position
+  };
+}
+
+function ifNode(name, id, position, expression) {
+  return {
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict' },
+        conditions: [{ id: id + '-condition', leftValue: expression, rightValue: true, operator: { type: 'boolean', operation: 'true', singleValue: true } }],
+        combinator: 'and'
+      },
+      options: {}
+    },
+    id: id,
+    name: name,
+    type: 'n8n-nodes-base.if',
+    typeVersion: 2,
+    position: position
+  };
+}
+
+const RETRY = { retryOnFail: true, maxTries: 3, waitBetweenTries: 3000 };
+const BASE_URL = "{{ $('" + CONFIG_NODE + "').first().json.config.hubspotBaseUrl }}";
+
+function hubspotGet(name, id, position, apiPath, extra) {
+  return Object.assign({
+    parameters: Object.assign({
+      method: 'GET',
+      url: '=' + BASE_URL + apiPath,
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'hubspotAppToken',
+      options: {}
+    }, extra || {}),
+    id: id,
+    name: name,
+    type: 'n8n-nodes-base.httpRequest',
+    typeVersion: 4.2,
+    position: position
+  }, RETRY);
+}
+
+function sheetsNode(name, id, position, tabKey) {
+  return {
+    parameters: {
+      operation: 'appendOrUpdate',
+      documentId: { __rl: true, value: "={{ $('" + CALC_NODE + "').first().json.target.spreadsheetId }}", mode: 'id' },
+      sheetName: { __rl: true, value: "={{ $('" + CALC_NODE + "').first().json.target.tabs." + tabKey + ' }}', mode: 'name' },
+      columns: { mappingMode: 'autoMapInputData', value: {}, matchingColumns: ['row_key'], schema: [] },
+      options: { cellFormat: 'RAW' }
+    },
+    id: id,
+    name: name,
+    type: 'n8n-nodes-base.googleSheets',
+    typeVersion: 4.5,
+    position: position,
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000
+  };
+}
+
+function buildWorkflow() {
+  const configCore = extractCore('src/config.js', 'config');
+  const calculatorCore = extractCore('src/calculator.js', 'calculator');
+  let counter = 0;
+  const id = function () { counter++; return '4004d000-0000-4000-8000-' + String(counter).padStart(12, '0'); };
+
+  const nodes = [
+    {
+      parameters: { rule: { interval: [{ field: 'cronExpression', expression: '15 6 * * *' }] } },
+      id: id(), name: 'Daily Forecast Schedule', type: 'n8n-nodes-base.scheduleTrigger', typeVersion: 1.2, position: [0, 200]
+    },
+    { parameters: {}, id: id(), name: 'Manual Run (Testing)', type: 'n8n-nodes-base.manualTrigger', typeVersion: 1, position: [0, 400] },
+    codeNode(CONFIG_NODE, id(), [220, 300], [configCore], configGlue),
+    hubspotGet('HubSpot: Account Details', id(), [440, 300], '/account-info/v3/details'),
+    codeNode(GATE_NODE, id(), [660, 300], [configCore], gateGlue),
+    hubspotGet(PIPELINES_NODE, id(), [880, 300], '/crm/v3/pipelines/deals'),
+    codeNode(PLAN_NODE, id(), [1100, 300], [calculatorCore], planGlue),
+    hubspotGet('HubSpot: Deals with Stage History', id(), [1320, 300], '/crm/v3/objects/deals', {
+      sendQuery: true,
+      queryParameters: {
+        parameters: [
+          { name: 'limit', value: '50' },
+          { name: 'archived', value: 'false' },
+          { name: 'properties', value: '={{ $json.properties }}' },
+          { name: 'propertiesWithHistory', value: 'dealstage' }
+        ]
+      },
+      options: {
+        pagination: {
+          pagination: {
+            paginationMode: 'updateAParameterInEachRequest',
+            parameters: { parameters: [{ type: 'qs', name: 'after', value: '={{ $response.body.paging.next.after }}' }] },
+            paginationCompleteWhen: 'other',
+            completeExpression: '={{ !$response.body.paging || !$response.body.paging.next }}',
+            limitPagesFetched: true,
+            maxRequests: "={{ $('" + PLAN_NODE + "').first().json.config.maxDealPages }}",
+            requestInterval: 200
+          }
+        }
+      }
+    }),
+    codeNode(CALC_NODE, id(), [1540, 300], [calculatorCore], calculateGlue),
+    ifNode('Writes Enabled?', id(), [1760, 300], '={{ $json.writesEnabled }}'),
+    { parameters: {}, id: id(), name: 'Dry Run Preview (No Writes)', type: 'n8n-nodes-base.noOp', typeVersion: 1, position: [1980, 560] },
+    codeNode('Rows: Forecast Summary', id(), [1980, 0], [], summaryRowsGlue),
+    codeNode('Rows: Stage Probabilities', id(), [1980, 160], [], stageRowsGlue),
+    codeNode('Rows: Forecast by Period', id(), [1980, 320], [], periodRowsGlue),
+    sheetsNode('Google Sheets: Upsert Forecast Summary', id(), [2200, 0], 'summary'),
+    sheetsNode('Google Sheets: Upsert Stage Probabilities', id(), [2200, 160], 'stages'),
+    sheetsNode('Google Sheets: Upsert Forecast by Period', id(), [2200, 320], 'periods'),
+    ifNode('Dashboard Webhook Configured?', id(), [1980, 440], '={{ $json.dashboardWebhookConfigured }}'),
+    Object.assign({
+      parameters: {
+        method: 'POST',
+        url: '={{ $env.DASHBOARD_WEBHOOK_URL }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify({ runAt: $json.runAt, runDate: $json.runDate, writeMode: $json.writeMode, summary: $json.rows.summary, warnings: $json.warnings }) }}',
+        options: { timeout: 30000 }
+      },
+      id: id(), name: 'Dashboard: Push Summary', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.2, position: [2200, 440]
+    }, RETRY)
+  ];
+
+  const link = function (target) { return { node: target, type: 'main', index: 0 }; };
+  const connections = {
+    'Daily Forecast Schedule': { main: [[link(CONFIG_NODE)]] },
+    'Manual Run (Testing)': { main: [[link(CONFIG_NODE)]] },
+    [CONFIG_NODE]: { main: [[link('HubSpot: Account Details')]] },
+    'HubSpot: Account Details': { main: [[link(GATE_NODE)]] },
+    [GATE_NODE]: { main: [[link(PIPELINES_NODE)]] },
+    [PIPELINES_NODE]: { main: [[link(PLAN_NODE)]] },
+    [PLAN_NODE]: { main: [[link('HubSpot: Deals with Stage History')]] },
+    'HubSpot: Deals with Stage History': { main: [[link(CALC_NODE)]] },
+    [CALC_NODE]: { main: [[link('Writes Enabled?')]] },
+    'Writes Enabled?': {
+      main: [
+        [link('Rows: Forecast Summary'), link('Rows: Stage Probabilities'), link('Rows: Forecast by Period'), link('Dashboard Webhook Configured?')],
+        [link('Dry Run Preview (No Writes)')]
+      ]
+    },
+    'Rows: Forecast Summary': { main: [[link('Google Sheets: Upsert Forecast Summary')]] },
+    'Rows: Stage Probabilities': { main: [[link('Google Sheets: Upsert Stage Probabilities')]] },
+    'Rows: Forecast by Period': { main: [[link('Google Sheets: Upsert Forecast by Period')]] },
+    'Dashboard Webhook Configured?': { main: [[link('Dashboard: Push Summary')], []] }
+  };
+
+  return {
+    name: 'HubSpot Probability-Weighted Forecast Calculator (DRY RUN + SANDBOX by default)',
+    nodes: nodes,
+    connections: connections,
+    active: false,
+    settings: { executionOrder: 'v1', saveManualExecutions: true, callerPolicy: 'workflowsFromSameOwner' },
+    pinData: {},
+    meta: { templateCredsSetupCompleted: false },
+    tags: []
+  };
+}
+
+function render() {
+  return JSON.stringify(buildWorkflow(), null, 2) + '\n';
+}
+
+if (require.main === module) {
+  const output = render();
+  if (process.argv.includes('--check')) {
+    const current = fs.existsSync(OUTPUT) ? fs.readFileSync(OUTPUT, 'utf8') : '';
+    if (current !== output) {
+      process.stderr.write('workflow.json is out of date. Run: npm run build:workflow\n');
+      process.exitCode = 1;
+    } else {
+      process.stdout.write('workflow.json is in sync with src/.\n');
+    }
+  } else {
+    fs.writeFileSync(OUTPUT, output);
+    process.stdout.write('Wrote ' + path.relative(process.cwd(), OUTPUT) + '\n');
+  }
+}
+
+module.exports = { buildWorkflow, render, extractCore, bodyOf, CONFIG_NODE, GATE_NODE, PLAN_NODE, PIPELINES_NODE, CALC_NODE };
