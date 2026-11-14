@@ -67,6 +67,8 @@ In this data set the static percentages overstate the forecast by almost a quart
 
 ## Architecture & data flow
 
+![Workflow Architecture Diagram](assets/workflow-diagram.png)
+
 ```mermaid
 flowchart TD
     A1["Schedule trigger<br/>daily 06:15"] --> B
